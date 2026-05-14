@@ -1,0 +1,45 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "attendance_gui.py"
+      - "attendance_parser.py"
+      - "name_mapping.json"
+      - "build_exe.bat"
+      - ".github/workflows/build-windows-exe.yml"
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas openpyxl xlrd pyinstaller
+
+      - name: Build executable
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name attendance_gui attendance_gui.py
+          if (Test-Path name_mapping.json) {
+            Copy-Item name_mapping.json dist\name_mapping.json -Force
+          }
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attendance-gui-windows
+          path: |
+            dist/attendance_gui.exe
+            dist/name_mapping.json
+          if-no-files-found: error
