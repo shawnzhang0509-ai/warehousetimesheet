@@ -86,6 +86,42 @@ def calc_time_diff(start, end):
     return round((e - s) / 3600, 2)
 
 
+def date_key_from_value(value):
+    """把调整表/打卡表中的日期归一为 04月20日。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return f"{value.month:02d}月{value.day:02d}日"
+
+    text = str(value).strip()
+    if not text or text.lower() == 'nan':
+        return None
+
+    m = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*日?', text)
+    if m:
+        return f"{int(m.group(1)):02d}月{int(m.group(2)):02d}日"
+
+    m = re.search(r'(\d{4})[-/\.](\d{1,2})[-/\.](\d{1,2})', text)
+    if m:
+        return f"{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
+
+    m = re.search(r'(\d{1,2})[/\.](\d{1,2})', text)
+    if m:
+        first, second = int(m.group(1)), int(m.group(2))
+        if first > 12:
+            day, month = first, second
+        elif second > 12:
+            month, day = first, second
+        else:
+            day, month = first, second
+        return f"{month:02d}月{day:02d}日"
+
+    parsed = pd.to_datetime(text, errors='coerce')
+    if pd.notna(parsed):
+        return f"{parsed.month:02d}月{parsed.day:02d}日"
+    return None
+
+
 # ============================================================
 # 考勤更改说明表解析
 # ============================================================
@@ -140,14 +176,8 @@ def parse_adjustment_table(filepath):
         except (ValueError, TypeError):
             continue
 
-        # 解析日期
-        date_key = None
-        if pd.notna(date_val):
-            date_str = str(date_val).strip()
-            m = re.match(r'(\d{1,2})[/\.](\d{1,2})', date_str)
-            if m:
-                d, mon = int(m.group(1)), int(m.group(2))
-                date_key = f"{mon:02d}月{d:02d}日"
+        # 解析日期，兼容 20/04、04/20、04月20日、2026-04-20 等格式。
+        date_key = date_key_from_value(date_val)
 
         if date_key:
             adj_map[(name, date_key)] = start_hour
@@ -200,26 +230,63 @@ def normalize_text_key(value):
     return re.sub(r'\s+', ' ', str(value or '').strip()).casefold()
 
 
+def mapping_entry_names(entry):
+    """从名字映射项中提取可用于合并/调整表匹配的姓名和别名。"""
+    if not entry:
+        return []
+    if isinstance(entry, str):
+        return ordered_unique([entry])
+    if isinstance(entry, list):
+        return ordered_unique(entry)
+    if not isinstance(entry, dict):
+        return []
+
+    names = []
+    first = str(entry.get('first_name', '') or '').strip()
+    last = str(entry.get('last_name', '') or '').strip()
+    if first or last:
+        names.append(' '.join(part for part in (first, last) if part))
+
+    for key in ('name', 'legal_name', 'display_name', 'chinese_name', 'adjustment_name'):
+        if entry.get(key):
+            names.append(entry.get(key))
+
+    for key in ('aliases', 'alias', 'chinese_names', 'adjustment_names', 'punch_names'):
+        value = entry.get(key)
+        if isinstance(value, list):
+            names.extend(value)
+        elif value:
+            names.append(value)
+
+    return ordered_unique(names)
+
+
 def mapped_name_for_merge(name, name_mapping=None):
     """返回用于识别同一人的映射姓名；没有映射时保留打卡机姓名。"""
     punch_name = str(name or '').strip()
     if not name_mapping or punch_name not in name_mapping:
         return punch_name
 
-    mapped = name_mapping[punch_name] or {}
-    first = str(mapped.get('first_name', '') or '').strip()
-    last = str(mapped.get('last_name', '') or '').strip()
-    mapped_name = ' '.join(part for part in (first, last) if part)
-    return mapped_name or punch_name
+    names = mapping_entry_names(name_mapping[punch_name])
+    return names[0] if names else punch_name
+
+
+def aliases_for_name(name, name_mapping=None):
+    """返回打卡名及其映射别名，用于中文调整表匹配。"""
+    punch_name = str(name or '').strip()
+    aliases = [punch_name]
+    if name_mapping and punch_name in name_mapping:
+        aliases.extend(mapping_entry_names(name_mapping[punch_name]))
+    return ordered_unique(aliases)
 
 
 def record_identity_tokens(row, name_mapping=None):
     """同一日期内姓名/映射名相同即合并；员工号在不同打卡机间可能重复，不能单独作为跨仓库身份。"""
     tokens = []
-    mapped_name = mapped_name_for_merge(row.get('姓名', ''), name_mapping)
-    name_key = normalize_text_key(mapped_name)
-    if name_key:
-        tokens.append(('姓名', name_key))
+    for name in aliases_for_name(row.get('姓名', ''), name_mapping):
+        name_key = normalize_text_key(name)
+        if name_key:
+            tokens.append(('姓名', name_key))
     return tokens
 
 
@@ -278,11 +345,7 @@ def group_name_aliases(rows, name_mapping=None):
     """同一合并组内可能出现的打卡名和映射名，供调整规则匹配。"""
     names = []
     for row in rows:
-        raw_name = row.get('姓名', '')
-        names.append(raw_name)
-        mapped_name = mapped_name_for_merge(raw_name, name_mapping)
-        if mapped_name != raw_name:
-            names.append(mapped_name)
+        names.extend(aliases_for_name(row.get('姓名', ''), name_mapping))
     return ordered_unique(names)
 
 
@@ -372,16 +435,25 @@ def extract_from_file(filepath, source_name):
 
 def find_adjustment(names, date_key, adj_map):
     """在同一人的多个姓名别名中查找调整表规则。"""
+    if not adj_map:
+        return None
     for candidate in names:
         if (candidate, date_key) in adj_map:
             return adj_map[(candidate, date_key)]
     for candidate in names:
         if (candidate, 'ALL') in adj_map:
             return adj_map[(candidate, 'ALL')]
+    normalized_names = {normalize_text_key(candidate) for candidate in names}
+    for (adj_name, adj_date), start_hour in adj_map.items():
+        if adj_date == date_key and normalize_text_key(adj_name) in normalized_names:
+            return start_hour
+    for (adj_name, adj_date), start_hour in adj_map.items():
+        if adj_date == 'ALL' and normalize_text_key(adj_name) in normalized_names:
+            return start_hour
     return None
 
 
-def get_adjusted_start(name, date_key, original_time, adj_map, aliases=None):
+def get_adjusted_start(name, date_key, original_time, adj_map=None, aliases=None):
     """获取调整后的起始时间"""
     names = ordered_unique([name] + (aliases or []))
     adjustment = find_adjustment(names, date_key, adj_map)
@@ -394,10 +466,13 @@ def get_adjusted_start(name, date_key, original_time, adj_map, aliases=None):
     return original_time
 
 
-def merge_cross_source(records_df, adj_map=None, name_mapping=None):
+def merge_cross_source(records_df, adj_map=None, name_mapping=None, apply_cap_rule=None):
     """合并多来源打卡记录，应用更改说明表规则，计算最终工时（纯Python实现，避免pandas groupby兼容性问题）"""
     if records_df.empty:
         return records_df
+    if apply_cap_rule is None:
+        apply_cap_rule = bool(adj_map)
+    adj_map = adj_map or {}
 
     def to_time_obj(s):
         if not s:
@@ -431,8 +506,8 @@ def merge_cross_source(records_df, adj_map=None, name_mapping=None):
         end_time = to_time_obj(latest_end_str)
 
         # 应用更改说明表规则
-        if adj_map:
-            date_key = date_4m.replace('4月', '04月')
+        if apply_cap_rule:
+            date_key = date_key_from_value(date_4m) or date_4m
             adjusted_start = get_adjusted_start(name, date_key, original_start, adj_map, aliases)
         else:
             adjusted_start = original_start
@@ -451,8 +526,8 @@ def merge_cross_source(records_df, adj_map=None, name_mapping=None):
 
         # 调整标记
         adj_mark = ''
-        if adj_map:
-            date_key = date_4m.replace('4月', '04月')
+        if apply_cap_rule:
+            date_key = date_key_from_value(date_4m) or date_4m
             if find_adjustment(aliases, date_key, adj_map) is not None:
                 adj_mark = '已调整'
             elif original_start and original_start < time(9, 0, 0) and not any('mandeep' in candidate.lower() for candidate in aliases):
@@ -669,14 +744,15 @@ def main():
 
     print(f"\n总共提取: {len(all_records)} 条记录")
 
-    # 读取更改说明表
-    adj_map = parse_adjustment_table(args.adjustment) if args.adjustment else {}
-
     # 读取名字映射
     name_mapping = load_name_mapping(args.mapping) if args.mapping else {}
 
+    # 读取更改说明表；只要传入了有效更改表，就启用 9AM 封顶，即使表里没有该员工的特殊规则。
+    apply_cap_rule = bool(args.adjustment and os.path.exists(args.adjustment))
+    adj_map = parse_adjustment_table(args.adjustment) if apply_cap_rule else {}
+
     # 合并并计算工时
-    merged = merge_cross_source(df, adj_map, name_mapping)
+    merged = merge_cross_source(df, adj_map, name_mapping, apply_cap_rule=apply_cap_rule)
     print(f"合并后: {len(merged)} 条记录, {merged['姓名'].nunique()} 人")
 
     # 检查未映射的名字

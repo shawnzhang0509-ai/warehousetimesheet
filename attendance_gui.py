@@ -71,6 +71,36 @@ def calc_time_diff(start, end):
     return round((e - s) / 3600, 2)
 
 
+def date_key_from_value(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return f"{value.month:02d}月{value.day:02d}日"
+    text = str(value).strip()
+    if not text or text.lower() == 'nan':
+        return None
+    m = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*日?', text)
+    if m:
+        return f"{int(m.group(1)):02d}月{int(m.group(2)):02d}日"
+    m = re.search(r'(\d{4})[-/\.](\d{1,2})[-/\.](\d{1,2})', text)
+    if m:
+        return f"{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
+    m = re.search(r'(\d{1,2})[/\.](\d{1,2})', text)
+    if m:
+        first, second = int(m.group(1)), int(m.group(2))
+        if first > 12:
+            day, month = first, second
+        elif second > 12:
+            month, day = first, second
+        else:
+            day, month = first, second
+        return f"{month:02d}月{day:02d}日"
+    parsed = pd.to_datetime(text, errors='coerce')
+    if pd.notna(parsed):
+        return f"{parsed.month:02d}月{parsed.day:02d}日"
+    return None
+
+
 def get_adjusted_start(name, date_key, original_time, adj_map):
     if (name, date_key) in adj_map:
         return time_from_hour(adj_map[(name, date_key)])
@@ -96,23 +126,55 @@ def normalize_text_key(value):
     return re.sub(r'\s+', ' ', str(value or '').strip()).casefold()
 
 
+def mapping_entry_names(entry):
+    if not entry:
+        return []
+    if isinstance(entry, str):
+        return ordered_unique([entry])
+    if isinstance(entry, list):
+        return ordered_unique(entry)
+    if not isinstance(entry, dict):
+        return []
+
+    names = []
+    first = str(entry.get('first_name', '') or '').strip()
+    last = str(entry.get('last_name', '') or '').strip()
+    if first or last:
+        names.append(' '.join(part for part in (first, last) if part))
+    for key in ('name', 'legal_name', 'display_name', 'chinese_name', 'adjustment_name'):
+        if entry.get(key):
+            names.append(entry.get(key))
+    for key in ('aliases', 'alias', 'chinese_names', 'adjustment_names', 'punch_names'):
+        value = entry.get(key)
+        if isinstance(value, list):
+            names.extend(value)
+        elif value:
+            names.append(value)
+    return ordered_unique(names)
+
+
 def mapped_name_for_merge(name, name_mapping=None):
     punch_name = str(name or '').strip()
     if not name_mapping or punch_name not in name_mapping:
         return punch_name
-    mapped = name_mapping[punch_name] or {}
-    first = str(mapped.get('first_name', '') or '').strip()
-    last = str(mapped.get('last_name', '') or '').strip()
-    mapped_name = ' '.join(part for part in (first, last) if part)
-    return mapped_name or punch_name
+    names = mapping_entry_names(name_mapping[punch_name])
+    return names[0] if names else punch_name
+
+
+def aliases_for_name(name, name_mapping=None):
+    punch_name = str(name or '').strip()
+    aliases = [punch_name]
+    if name_mapping and punch_name in name_mapping:
+        aliases.extend(mapping_entry_names(name_mapping[punch_name]))
+    return ordered_unique(aliases)
 
 
 def record_identity_tokens(row, name_mapping=None):
     tokens = []
-    mapped_name = mapped_name_for_merge(row.get('姓名', ''), name_mapping)
-    name_key = normalize_text_key(mapped_name)
-    if name_key:
-        tokens.append(('姓名', name_key))
+    for name in aliases_for_name(row.get('姓名', ''), name_mapping):
+        name_key = normalize_text_key(name)
+        if name_key:
+            tokens.append(('姓名', name_key))
     return tokens
 
 
@@ -168,11 +230,7 @@ def ordered_unique(values):
 def group_name_aliases(rows, name_mapping=None):
     names = []
     for row in rows:
-        raw_name = row.get('姓名', '')
-        names.append(raw_name)
-        mapped_name = mapped_name_for_merge(raw_name, name_mapping)
-        if mapped_name != raw_name:
-            names.append(mapped_name)
+        names.extend(aliases_for_name(row.get('姓名', ''), name_mapping))
     return ordered_unique(names)
 
 
@@ -186,12 +244,21 @@ def choose_group_name(rows, name_mapping=None):
 
 
 def find_adjustment(names, date_key, adj_map):
+    if not adj_map:
+        return None
     for candidate in names:
         if (candidate, date_key) in adj_map:
             return adj_map[(candidate, date_key)]
     for candidate in names:
         if (candidate, 'ALL') in adj_map:
             return adj_map[(candidate, 'ALL')]
+    normalized_names = {normalize_text_key(candidate) for candidate in names}
+    for (adj_name, adj_date), start_hour in adj_map.items():
+        if adj_date == date_key and normalize_text_key(adj_name) in normalized_names:
+            return start_hour
+    for (adj_name, adj_date), start_hour in adj_map.items():
+        if adj_date == 'ALL' and normalize_text_key(adj_name) in normalized_names:
+            return start_hour
     return None
 
 
@@ -274,21 +341,19 @@ def parse_adjustment_table(filepath):
             start_hour = float(time_val)
         except:
             continue
-        date_key = None
-        if pd.notna(date_val):
-            m = re.match(r'(\d{1,2})[/\.](\d{1,2})', str(date_val).strip())
-            if m:
-                d, mon = int(m.group(1)), int(m.group(2))
-                date_key = f"{mon:02d}月{d:02d}日"
+        date_key = date_key_from_value(date_val)
         if date_key:
             adj_map[(str(name).strip(), date_key)] = start_hour
     return adj_map
 
 
-def merge_and_calc(records, adj_map=None, name_mapping=None):
+def merge_and_calc(records, adj_map=None, name_mapping=None, apply_cap_rule=None):
     """合并多来源记录并计算工时"""
     if not records:
         return pd.DataFrame()
+    if apply_cap_rule is None:
+        apply_cap_rule = bool(adj_map)
+    adj_map = adj_map or {}
     
     # 同一天内规范化姓名或映射后的 legal name 相同才合入同一组。
     # 两套打卡机的员工号可能各自编号，不能跨仓库单独作为合并依据。
@@ -313,8 +378,8 @@ def merge_and_calc(records, adj_map=None, name_mapping=None):
         orig_start = to_time_obj(earliest)
         end_time = to_time_obj(latest)
         
-        if adj_map:
-            date_key = date_4m.replace('4月', '04月')
+        if apply_cap_rule:
+            date_key = date_key_from_value(date_4m) or date_4m
             adjustment = find_adjustment(aliases, date_key, adj_map)
             if adjustment is not None:
                 adj_start = time_from_hour(adjustment)
@@ -342,8 +407,8 @@ def merge_and_calc(records, adj_map=None, name_mapping=None):
         
         # 调整标记
         adj_mark = ''
-        if adj_map:
-            date_key = date_4m.replace('4月', '04月')
+        if apply_cap_rule:
+            date_key = date_key_from_value(date_4m) or date_4m
             if find_adjustment(aliases, date_key, adj_map) is not None:
                 adj_mark = '已调整'
             elif orig_start and orig_start < time(9, 0, 0) and not any('mandeep' in candidate.lower() for candidate in aliases):
@@ -637,7 +702,8 @@ class AttendanceGUI:
         
         # 读取更改说明表
         adj_map = {}
-        if self.adjust_path.get() and os.path.exists(self.adjust_path.get()):
+        apply_cap_rule = bool(self.adjust_path.get() and os.path.exists(self.adjust_path.get()))
+        if apply_cap_rule:
             adj_map = parse_adjustment_table(self.adjust_path.get())
             self.result_text.insert(tk.END, f"📋 更改说明表: {len(adj_map)} 条规则\n")
         
@@ -648,7 +714,12 @@ class AttendanceGUI:
             mapping[punch] = {"first_name": first, "last_name": last}
         if mapping:
             self.name_mapping = mapping
-        self.parsed_data = merge_and_calc(all_records, adj_map, self.name_mapping)
+        self.parsed_data = merge_and_calc(
+            all_records,
+            adj_map,
+            self.name_mapping,
+            apply_cap_rule=apply_cap_rule,
+        )
         
         # 显示统计
         total_emp = self.parsed_data['姓名'].nunique()
