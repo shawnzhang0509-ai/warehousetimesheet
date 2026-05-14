@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 from openpyxl import load_workbook
 
-from attendance_parser import generate_report, merge_cross_source
+from attendance_parser import generate_report, merge_cross_source, parse_adjustment_table
 
 
 def record(emp_id, name, source, am_start='', am_end='', pm_start='', pm_end=''):
@@ -84,6 +84,46 @@ class AttendanceMergeTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged.iloc[0]['上班打卡'], '07:00:00')
         self.assertEqual(merged.iloc[0]['合计工时'], 11)
+        self.assertEqual(merged.iloc[0]['调整标记'], '已调整')
+
+    def test_caps_early_start_when_adjustment_table_has_no_employee_rule(self):
+        df = pd.DataFrame([
+            record(1, 'BU', 'warehouse-a', am_start='08:56:59', am_end='18:00:59'),
+        ])
+
+        merged = merge_cross_source(df, adj_map={}, apply_cap_rule=True)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged.iloc[0]['上班打卡'], '09:00:00')
+        self.assertEqual(merged.iloc[0]['合计工时'], 9.02)
+        self.assertEqual(merged.iloc[0]['调整标记'], '9AM封顶')
+
+    def test_chinese_adjustment_table_matches_alias_from_mapping(self):
+        df = pd.DataFrame([
+            record(1, 'BU', 'warehouse-a', am_start='08:56:59', am_end='18:00:59'),
+        ])
+        mapping = {
+            'BU': {'first_name': 'BU', 'last_name': '', 'aliases': ['布']},
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            adjust_path = f'{tmpdir}/adjustments.xlsx'
+            pd.DataFrame([
+                ['姓名', '日期', '未打卡时间'],
+                ['布', '4月20日', 8],
+            ]).to_excel(adjust_path, header=False, index=False)
+            adj_map = parse_adjustment_table(adjust_path)
+
+        merged = merge_cross_source(
+            df,
+            adj_map=adj_map,
+            name_mapping=mapping,
+            apply_cap_rule=True,
+        )
+
+        self.assertEqual(adj_map, {('布', '04月20日'): 8})
+        self.assertEqual(merged.iloc[0]['上班打卡'], '08:00:00')
+        self.assertEqual(merged.iloc[0]['合计工时'], 10.02)
         self.assertEqual(merged.iloc[0]['调整标记'], '已调整')
 
     def test_weekly_report_counts_only_positive_hour_days(self):
