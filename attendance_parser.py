@@ -195,6 +195,127 @@ def generate_name_mapping_template(all_names, output_path='name_mapping.json'):
     return mapping
 
 
+def normalize_text_key(value):
+    """姓名等文本合并键：忽略大小写和多余空格。"""
+    return re.sub(r'\s+', ' ', str(value or '').strip()).casefold()
+
+
+def normalize_employee_id(value):
+    """员工号合并键：把 Excel 常见的 1001.0 形式归一成 1001。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ''
+    text = str(value).strip()
+    if not text or text.lower() == 'nan':
+        return ''
+    try:
+        num = float(text)
+        if num.is_integer():
+            return str(int(num))
+    except (ValueError, TypeError):
+        pass
+    return text
+
+
+def mapped_name_for_merge(name, name_mapping=None):
+    """返回用于识别同一人的映射姓名；没有映射时保留打卡机姓名。"""
+    punch_name = str(name or '').strip()
+    if not name_mapping or punch_name not in name_mapping:
+        return punch_name
+
+    mapped = name_mapping[punch_name] or {}
+    first = str(mapped.get('first_name', '') or '').strip()
+    last = str(mapped.get('last_name', '') or '').strip()
+    mapped_name = ' '.join(part for part in (first, last) if part)
+    return mapped_name or punch_name
+
+
+def record_identity_tokens(row, name_mapping=None):
+    """同一日期内任一身份 token 相同即合并，兼容跨仓库员工号或姓名差异。"""
+    tokens = []
+    emp_id = normalize_employee_id(row.get('员工号'))
+    if emp_id:
+        tokens.append(('员工号', emp_id))
+
+    mapped_name = mapped_name_for_merge(row.get('姓名', ''), name_mapping)
+    name_key = normalize_text_key(mapped_name)
+    if name_key:
+        tokens.append(('姓名', name_key))
+    return tokens
+
+
+def build_identity_groups(records, name_mapping=None):
+    """把记录按日期和身份 token 合成连通分组。"""
+    groups = []
+    token_to_group = {}
+
+    for row in records:
+        date_key = row.get('日期', '')
+        tokens = [(date_key, kind, value) for kind, value in record_identity_tokens(row, name_mapping)]
+        matching_groups = []
+        for token in tokens:
+            group_idx = token_to_group.get(token)
+            if group_idx is not None and group_idx not in matching_groups:
+                matching_groups.append(group_idx)
+
+        if not matching_groups:
+            group_idx = len(groups)
+            groups.append([row])
+        else:
+            group_idx = matching_groups[0]
+            groups[group_idx].append(row)
+            for other_idx in matching_groups[1:]:
+                if other_idx == group_idx or not groups[other_idx]:
+                    continue
+                groups[group_idx].extend(groups[other_idx])
+                groups[other_idx] = []
+                for token, existing_idx in list(token_to_group.items()):
+                    if existing_idx == other_idx:
+                        token_to_group[token] = group_idx
+
+        for token in tokens:
+            token_to_group[token] = group_idx
+
+    return [group for group in groups if group]
+
+
+def ordered_unique(values):
+    """保持首次出现顺序去重。"""
+    seen = set()
+    result = []
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def group_name_aliases(rows, name_mapping=None):
+    """同一合并组内可能出现的打卡名和映射名，供调整规则匹配。"""
+    names = []
+    for row in rows:
+        raw_name = row.get('姓名', '')
+        names.append(raw_name)
+        mapped_name = mapped_name_for_merge(raw_name, name_mapping)
+        if mapped_name != raw_name:
+            names.append(mapped_name)
+    return ordered_unique(names)
+
+
+def choose_group_name(rows, name_mapping=None):
+    """报表显示姓名优先选择有名字映射的打卡名，否则沿用第一条记录。"""
+    if name_mapping:
+        for row in rows:
+            raw_name = str(row.get('姓名', '') or '').strip()
+            if raw_name in name_mapping:
+                return raw_name
+    return str(rows[0].get('姓名', '') or '').strip()
+
+
 # ============================================================
 # 打卡记录提取
 # ============================================================
@@ -269,20 +390,31 @@ def extract_from_file(filepath, source_name):
 # 多来源合并与工时计算
 # ============================================================
 
-def get_adjusted_start(name, date_key, original_time, adj_map):
+def find_adjustment(names, date_key, adj_map):
+    """在同一人的多个姓名别名中查找调整表规则。"""
+    for candidate in names:
+        if (candidate, date_key) in adj_map:
+            return adj_map[(candidate, date_key)]
+    for candidate in names:
+        if (candidate, 'ALL') in adj_map:
+            return adj_map[(candidate, 'ALL')]
+    return None
+
+
+def get_adjusted_start(name, date_key, original_time, adj_map, aliases=None):
     """获取调整后的起始时间"""
-    if (name, date_key) in adj_map:
-        return time_from_hour(adj_map[(name, date_key)])
-    if (name, 'ALL') in adj_map:
-        return time_from_hour(adj_map[(name, 'ALL')])
-    if 'mandeep' in name.lower():
+    names = ordered_unique([name] + (aliases or []))
+    adjustment = find_adjustment(names, date_key, adj_map)
+    if adjustment is not None:
+        return time_from_hour(adjustment)
+    if any('mandeep' in candidate.lower() for candidate in names):
         return original_time
     if original_time is not None and original_time < time(9, 0, 0):
         return time(9, 0, 0)
     return original_time
 
 
-def merge_cross_source(records_df, adj_map=None):
+def merge_cross_source(records_df, adj_map=None, name_mapping=None):
     """合并多来源打卡记录，应用更改说明表规则，计算最终工时（纯Python实现，避免pandas groupby兼容性问题）"""
     if records_df.empty:
         return records_df
@@ -293,17 +425,15 @@ def merge_cross_source(records_df, adj_map=None):
         p = list(map(int, s.split(':')))
         return time(p[0], p[1], p[2])
 
-    # 按姓名+日期分组
-    groups = {}
-    for _, row in records_df.iterrows():
-        key = (row['姓名'], row['日期'])
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(row.to_dict())
+    # 同一天内员工号相同或规范化姓名相同都合入同一组，兼容不同仓库的编码/姓名差异。
+    groups = build_identity_groups([row.to_dict() for _, row in records_df.iterrows()], name_mapping)
 
     results = []
-    for (name, date_4m), rows in sorted(groups.items()):
+    for rows in sorted(groups, key=lambda group: (str(group[0].get('日期', '')), normalize_text_key(choose_group_name(group, name_mapping)))):
         first = rows[0]
+        date_4m = first['日期']
+        name = choose_group_name(rows, name_mapping)
+        aliases = group_name_aliases(rows, name_mapping)
 
         # 收集所有打卡时间
         all_am_s = sorted(set(r['上午上班'] for r in rows if r['上午上班']))
@@ -322,7 +452,7 @@ def merge_cross_source(records_df, adj_map=None):
         # 应用更改说明表规则
         if adj_map:
             date_key = date_4m.replace('4月', '04月')
-            adjusted_start = get_adjusted_start(name, date_key, original_start, adj_map)
+            adjusted_start = get_adjusted_start(name, date_key, original_start, adj_map, aliases)
         else:
             adjusted_start = original_start
 
@@ -342,19 +472,19 @@ def merge_cross_source(records_df, adj_map=None):
         adj_mark = ''
         if adj_map:
             date_key = date_4m.replace('4月', '04月')
-            if (name, date_key) in adj_map or (name, 'ALL') in adj_map:
+            if find_adjustment(aliases, date_key, adj_map) is not None:
                 adj_mark = '已调整'
-            elif original_start and original_start < time(9, 0, 0) and 'mandeep' not in name.lower():
+            elif original_start and original_start < time(9, 0, 0) and not any('mandeep' in candidate.lower() for candidate in aliases):
                 adj_mark = '9AM封顶'
 
-        sources = '+'.join(sorted(set(r['数据来源'] for r in rows if r['数据来源'])))
+        sources = '+'.join(sorted(set(r.get('数据来源', '') for r in rows if r.get('数据来源', ''))))
 
         results.append({
-            '员工号': first['员工号'],
+            '员工号': first.get('员工号', ''),
             '姓名': name,
-            '部门': first['部门'],
+            '部门': first.get('部门', ''),
             '日期': date_4m,
-            '星期': first['星期'],
+            '星期': first.get('星期', ''),
             '上班打卡': format_time(adjusted_start),
             '下班打卡': format_time(end_time),
             '上午上班': all_am_s[0] if all_am_s else '',
@@ -563,7 +693,7 @@ def main():
     name_mapping = load_name_mapping(args.mapping) if args.mapping else {}
 
     # 合并并计算工时
-    merged = merge_cross_source(df, adj_map)
+    merged = merge_cross_source(df, adj_map, name_mapping)
     print(f"合并后: {len(merged)} 条记录, {merged['姓名'].nunique()} 人")
 
     # 检查未映射的名字
