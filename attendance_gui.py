@@ -96,21 +96,6 @@ def normalize_text_key(value):
     return re.sub(r'\s+', ' ', str(value or '').strip()).casefold()
 
 
-def normalize_employee_id(value):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ''
-    text = str(value).strip()
-    if not text or text.lower() == 'nan':
-        return ''
-    try:
-        num = float(text)
-        if num.is_integer():
-            return str(int(num))
-    except:
-        pass
-    return text
-
-
 def mapped_name_for_merge(name, name_mapping=None):
     punch_name = str(name or '').strip()
     if not name_mapping or punch_name not in name_mapping:
@@ -124,9 +109,6 @@ def mapped_name_for_merge(name, name_mapping=None):
 
 def record_identity_tokens(row, name_mapping=None):
     tokens = []
-    emp_id = normalize_employee_id(row.get('员工号'))
-    if emp_id:
-        tokens.append(('员工号', emp_id))
     mapped_name = mapped_name_for_merge(row.get('姓名', ''), name_mapping)
     name_key = normalize_text_key(mapped_name)
     if name_key:
@@ -308,7 +290,8 @@ def merge_and_calc(records, adj_map=None, name_mapping=None):
     if not records:
         return pd.DataFrame()
     
-    # 同一天内员工号相同或规范化姓名相同都合入同一组，兼容不同仓库的编码/姓名差异。
+    # 同一天内规范化姓名或映射后的 legal name 相同才合入同一组。
+    # 两套打卡机的员工号可能各自编号，不能跨仓库单独作为合并依据。
     groups = build_identity_groups(records, name_mapping)
     
     results = []
@@ -736,8 +719,10 @@ class AttendanceGUI:
         pivot = self.parsed_data.pivot_table(
             index=['姓名', '部门'], columns='日期', values='合计工时', aggfunc='first'
         ).reset_index()
-        weekly = self.parsed_data.groupby(['姓名', '部门']).agg({
-            '工作工时': 'sum', '加班工时': 'sum', '合计工时': 'sum', '日期': 'count'
+        weekly_source = self.parsed_data.copy()
+        weekly_source['打卡天数'] = (weekly_source['合计工时'] > 0).astype(int)
+        weekly = weekly_source.groupby(['姓名', '部门']).agg({
+            '工作工时': 'sum', '加班工时': 'sum', '合计工时': 'sum', '打卡天数': 'sum'
         }).reset_index()
         weekly.columns = ['姓名', '部门', '本周工作工时', '本周加班工时', '本周合计工时', '打卡天数']
         pivot = pivot.merge(weekly, on=['姓名', '部门'], how='left')
