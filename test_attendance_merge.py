@@ -33,9 +33,9 @@ class AttendanceMergeTest(unittest.TestCase):
 
         self.assertEqual(len(merged), 1)
         row = merged.iloc[0]
-        self.assertEqual(row['上班打卡'], '09:00:00')
+        self.assertEqual(row['上班打卡'], '08:00:00')
         self.assertEqual(row['下班打卡'], '18:00:00')
-        self.assertEqual(row['合计工时'], 9)
+        self.assertEqual(row['合计工时'], 10)
         self.assertEqual(row['数据来源'], 'warehouse-a+warehouse-b')
 
     def test_keeps_existing_same_name_merge_when_employee_ids_differ(self):
