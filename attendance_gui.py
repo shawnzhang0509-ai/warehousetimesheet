@@ -92,6 +92,127 @@ def time_from_hour(hour_val):
         return None
 
 
+def normalize_text_key(value):
+    return re.sub(r'\s+', ' ', str(value or '').strip()).casefold()
+
+
+def normalize_employee_id(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ''
+    text = str(value).strip()
+    if not text or text.lower() == 'nan':
+        return ''
+    try:
+        num = float(text)
+        if num.is_integer():
+            return str(int(num))
+    except:
+        pass
+    return text
+
+
+def mapped_name_for_merge(name, name_mapping=None):
+    punch_name = str(name or '').strip()
+    if not name_mapping or punch_name not in name_mapping:
+        return punch_name
+    mapped = name_mapping[punch_name] or {}
+    first = str(mapped.get('first_name', '') or '').strip()
+    last = str(mapped.get('last_name', '') or '').strip()
+    mapped_name = ' '.join(part for part in (first, last) if part)
+    return mapped_name or punch_name
+
+
+def record_identity_tokens(row, name_mapping=None):
+    tokens = []
+    emp_id = normalize_employee_id(row.get('员工号'))
+    if emp_id:
+        tokens.append(('员工号', emp_id))
+    mapped_name = mapped_name_for_merge(row.get('姓名', ''), name_mapping)
+    name_key = normalize_text_key(mapped_name)
+    if name_key:
+        tokens.append(('姓名', name_key))
+    return tokens
+
+
+def build_identity_groups(records, name_mapping=None):
+    groups = []
+    token_to_group = {}
+
+    for row in records:
+        date_key = row.get('日期', '')
+        tokens = [(date_key, kind, value) for kind, value in record_identity_tokens(row, name_mapping)]
+        matching_groups = []
+        for token in tokens:
+            group_idx = token_to_group.get(token)
+            if group_idx is not None and group_idx not in matching_groups:
+                matching_groups.append(group_idx)
+
+        if not matching_groups:
+            group_idx = len(groups)
+            groups.append([row])
+        else:
+            group_idx = matching_groups[0]
+            groups[group_idx].append(row)
+            for other_idx in matching_groups[1:]:
+                if other_idx == group_idx or not groups[other_idx]:
+                    continue
+                groups[group_idx].extend(groups[other_idx])
+                groups[other_idx] = []
+                for token, existing_idx in list(token_to_group.items()):
+                    if existing_idx == other_idx:
+                        token_to_group[token] = group_idx
+
+        for token in tokens:
+            token_to_group[token] = group_idx
+
+    return [group for group in groups if group]
+
+
+def ordered_unique(values):
+    seen = set()
+    result = []
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def group_name_aliases(rows, name_mapping=None):
+    names = []
+    for row in rows:
+        raw_name = row.get('姓名', '')
+        names.append(raw_name)
+        mapped_name = mapped_name_for_merge(raw_name, name_mapping)
+        if mapped_name != raw_name:
+            names.append(mapped_name)
+    return ordered_unique(names)
+
+
+def choose_group_name(rows, name_mapping=None):
+    if name_mapping:
+        for row in rows:
+            raw_name = str(row.get('姓名', '') or '').strip()
+            if raw_name in name_mapping:
+                return raw_name
+    return str(rows[0].get('姓名', '') or '').strip()
+
+
+def find_adjustment(names, date_key, adj_map):
+    for candidate in names:
+        if (candidate, date_key) in adj_map:
+            return adj_map[(candidate, date_key)]
+    for candidate in names:
+        if (candidate, 'ALL') in adj_map:
+            return adj_map[(candidate, 'ALL')]
+    return None
+
+
 def extract_from_file(filepath):
     """从xls提取打卡记录"""
     if not filepath or not os.path.exists(filepath):
@@ -182,21 +303,20 @@ def parse_adjustment_table(filepath):
     return adj_map
 
 
-def merge_and_calc(records, adj_map=None):
+def merge_and_calc(records, adj_map=None, name_mapping=None):
     """合并多来源记录并计算工时"""
     if not records:
         return pd.DataFrame()
     
-    # 按姓名+日期分组
-    groups = {}
-    for r in records:
-        key = (r['姓名'], r['日期'])
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(r)
+    # 同一天内员工号相同或规范化姓名相同都合入同一组，兼容不同仓库的编码/姓名差异。
+    groups = build_identity_groups(records, name_mapping)
     
     results = []
-    for (name, date_4m), rows in sorted(groups.items()):
+    for rows in sorted(groups, key=lambda group: (str(group[0].get('日期', '')), normalize_text_key(choose_group_name(group, name_mapping)))):
+        name = choose_group_name(rows, name_mapping)
+        date_4m = rows[0]['日期']
+        aliases = group_name_aliases(rows, name_mapping)
+
         def to_time_obj(s):
             if not s: return None
             p = list(map(int, s.split(':')))
@@ -212,7 +332,15 @@ def merge_and_calc(records, adj_map=None):
         
         if adj_map:
             date_key = date_4m.replace('4月', '04月')
-            adj_start = get_adjusted_start(name, date_key, orig_start, adj_map)
+            adjustment = find_adjustment(aliases, date_key, adj_map)
+            if adjustment is not None:
+                adj_start = time_from_hour(adjustment)
+            elif any('mandeep' in candidate.lower() for candidate in aliases):
+                adj_start = orig_start
+            elif orig_start is not None and orig_start < time(9, 0, 0):
+                adj_start = time(9, 0, 0)
+            else:
+                adj_start = orig_start
         else:
             adj_start = orig_start
         
@@ -233,12 +361,13 @@ def merge_and_calc(records, adj_map=None):
         adj_mark = ''
         if adj_map:
             date_key = date_4m.replace('4月', '04月')
-            if (name, date_key) in adj_map or (name, 'ALL') in adj_map:
+            if find_adjustment(aliases, date_key, adj_map) is not None:
                 adj_mark = '已调整'
-            elif orig_start and orig_start < time(9, 0, 0) and 'mandeep' not in name.lower():
+            elif orig_start and orig_start < time(9, 0, 0) and not any('mandeep' in candidate.lower() for candidate in aliases):
                 adj_mark = '9AM封顶'
         
         results.append({
+            '员工号': rows[0].get('员工号', ''),
             '姓名': name, '部门': rows[0]['部门'], '日期': date_4m, '星期': rows[0]['星期'],
             '上班打卡': format_time(adj_start), '下班打卡': format_time(end_time),
             '工作工时': round(normal, 2), '加班工时': round(ot_hours, 2),
@@ -529,8 +658,14 @@ class AttendanceGUI:
             adj_map = parse_adjustment_table(self.adjust_path.get())
             self.result_text.insert(tk.END, f"📋 更改说明表: {len(adj_map)} 条规则\n")
         
-        # 合并计算
-        self.parsed_data = merge_and_calc(all_records, adj_map)
+        # 合并计算。优先使用界面中当前的名字映射，保证员工号缺失时也能跨仓库归并。
+        mapping = {}
+        for item in self.tree.get_children():
+            punch, first, last = self.tree.item(item)['values']
+            mapping[punch] = {"first_name": first, "last_name": last}
+        if mapping:
+            self.name_mapping = mapping
+        self.parsed_data = merge_and_calc(all_records, adj_map, self.name_mapping)
         
         # 显示统计
         total_emp = self.parsed_data['姓名'].nunique()
